@@ -11,8 +11,7 @@ use burn::{
 pub struct EncoderLayer<B: Backend> {
     self_attention: MultiHeadAttention<B>,
     self_attention_norm: LayerNorm<B>,
-    linear0: Linear<B>,
-    linear1: Linear<B>,
+    linear: [Linear<B>; 2],
     linear_norm: LayerNorm<B>,
     drop_out: Dropout,
 }
@@ -28,9 +27,9 @@ impl<B: Backend> EncoderLayer<B> {
             .forward(x.clone() + self_attention_output);
 
         // feed forward
-        let linear_output = self.linear0.forward(self_attention_output.clone());
+        let linear_output = self.linear[0].forward(self_attention_output.clone());
         let linear_output = relu(linear_output);
-        let linear_output = self.linear1.forward(linear_output);
+        let linear_output = self.linear[1].forward(linear_output);
         let linear_output = self.drop_out.forward(linear_output);
         self.linear_norm.forward(x + linear_output)
     }
