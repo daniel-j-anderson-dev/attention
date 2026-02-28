@@ -11,32 +11,31 @@ pub struct MultiHeadAttentionConfig {
     attention_head_count: usize,
 }
 impl MultiHeadAttentionConfig {
-    pub fn init<B: Backend>(self, device: &B::Device) -> MultiHeadAttention<B> {
-        let MultiHeadAttentionConfig {
+    pub fn init<B: Backend>(
+        &Self {
             model_dimension,
             head_dimension,
             attention_head_count,
-        } = self;
-
-        let linear_no_bias = || {
-            LinearConfig::new(model_dimension, model_dimension)
-                .with_bias(false)
-                .init::<B>(device)
-        };
-
-        let linear = || LinearConfig::new(model_dimension, model_dimension).init::<B>(device);
-
+        }: &Self,
+        device: &B::Device,
+    ) -> MultiHeadAttention<B> {
         MultiHeadAttention {
             model_dimension,
             head_dimension,
             attention_head_count,
 
-            query: linear_no_bias(),
-            key: linear_no_bias(),
-            value: linear_no_bias(),
+            query: LinearConfig::new(model_dimension, model_dimension)
+                .with_bias(false)
+                .init(device),
+            key: LinearConfig::new(model_dimension, model_dimension)
+                .with_bias(false)
+                .init(device),
+            value: LinearConfig::new(model_dimension, model_dimension)
+                .with_bias(false)
+                .init(device),
 
-            dense: linear(),
-            output: linear(),
+            dense: LinearConfig::new(model_dimension, model_dimension).init(device),
+            output: LinearConfig::new(model_dimension, model_dimension).init(device),
         }
     }
 }
