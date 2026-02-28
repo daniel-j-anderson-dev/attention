@@ -20,3 +20,8 @@ pub struct DecoderLayer<B: Backend> {
 
     drop_out: Dropout,
 }
+impl<B: Backend> DecoderLayer<B> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        todo!()
+    } 
+}
