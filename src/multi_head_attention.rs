@@ -1,28 +1,23 @@
 use burn::{
     nn::{Linear, LinearConfig},
     prelude::*,
-    tensor::activation::{relu, softmax},
+    tensor::activation::softmax,
 };
 
 #[derive(Debug, Config)]
 pub struct MultiHeadAttentionConfig {
     model_dimension: usize,
-    head_dimension: usize,
-    attention_head_count: usize,
+    head_count: usize,
 }
 impl MultiHeadAttentionConfig {
-    pub fn init<B: Backend>(
-        &Self {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> MultiHeadAttention<B> {
+        let &Self {
             model_dimension,
-            head_dimension,
-            attention_head_count,
-        }: &Self,
-        device: &B::Device,
-    ) -> MultiHeadAttention<B> {
+            head_count,
+        } = self;
         MultiHeadAttention {
             model_dimension,
-            head_dimension,
-            attention_head_count,
+            head_count,
 
             query: LinearConfig::new(model_dimension, model_dimension)
                 .with_bias(false)
@@ -34,8 +29,7 @@ impl MultiHeadAttentionConfig {
                 .with_bias(false)
                 .init(device),
 
-            dense: LinearConfig::new(model_dimension, model_dimension).init(device),
-            output: LinearConfig::new(model_dimension, model_dimension).init(device),
+            output_projection: LinearConfig::new(model_dimension, model_dimension).init(device),
         }
     }
 }
@@ -43,86 +37,90 @@ impl MultiHeadAttentionConfig {
 #[derive(Debug, Module)]
 pub struct MultiHeadAttention<B: Backend> {
     model_dimension: usize,
-    head_dimension: usize,
-    attention_head_count: usize,
+    head_count: usize,
 
     query: Linear<B>,
     key: Linear<B>,
     value: Linear<B>,
 
-    dense: Linear<B>,
-    output: Linear<B>,
+    output_projection: Linear<B>,
 }
 impl<B: Backend> MultiHeadAttention<B> {
+    fn head_dimension(&self) -> usize {
+        self.model_dimension / self.head_count
+    }
+
     fn scaled_dot_product_attention(
-        &self,
+        &self, // MultiHeadAttention
         query: Tensor<B, 4>,
         key: Tensor<B, 4>,
         value: Tensor<B, 4>,
         mask: Option<Tensor<B, 4, Bool>>,
     ) -> Tensor<B, 4> {
+        let d_k = self.head_dimension() as f64;
         let key_t = key.permute([0, 1, 3, 2]);
-        let sqrt_head_dimension = (self.head_dimension as f64).sqrt();
-        let mut scores = query.matmul(key_t) / sqrt_head_dimension;
+
+        // Q * K^T
+        let scores = query.matmul(key_t);
+
+        // scale
+        let mut scores = scores / d_k.sqrt();
+
+        // masking
         if let Some(mask) = mask {
-            scores = scores.mask_fill(mask, f32::NEG_INFINITY);
+            scores = scores.mask_fill(mask, 1e-9);
         }
-        let scores = softmax(scores, 3);
-        scores.matmul(value)
+
+        let weights = softmax(scores, 3);
+        weights.matmul(value)
+    }
+
+    /// - Reshapes `x`:
+    ///   - from: `[Batch, Length, Model_Dim]`
+    ///   - to:   `[Batch, Heads, Length, Head_Dim]`
+    fn split_heads(&self, x: Tensor<B, 3>) -> Tensor<B, 4> {
+        let [batch_size, sequence_length, _model_dimension] = x.dims();
+        x.reshape([
+            batch_size,
+            sequence_length,
+            self.head_count,
+            self.head_dimension(),
+        ])
+        .swap_dims(1, 2)
+    }
+
+    /// - Reshapes and transposes `x`:
+    ///   - from: `[Batch, Heads, Length, Head_Dim]`
+    ///   - to:   `[Batch, Length, Model_Dim]`
+    fn merge_heads(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
+        let [batch_size, _head_count, sequence_length, _model_dimension] = x.dims();
+        x.swap_dims(1, 2)
+            .reshape([batch_size, sequence_length, self.model_dimension])
     }
 
     pub fn forward(
         &self,
-        query_input: Tensor<B, 3>,
-        key_input: Tensor<B, 3>,
-        value_input: Tensor<B, 3>,
+        query: Tensor<B, 3>,
+        key: Tensor<B, 3>,
+        value: Tensor<B, 3>,
         mask: Option<Tensor<B, 4, Bool>>,
     ) -> Tensor<B, 3> {
-        let [batch_size, input_length, _input_dimension] = query_input.dims();
-
         // initial weight projections
-        let query_output = self.query.forward(query_input);
-        let key_output = self.key.forward(key_input);
-        let value_output = self.value.forward(value_input);
+        let query = self.query.forward(query);
+        let key = self.key.forward(key);
+        let value = self.value.forward(value);
 
-        // reshape
-        // from: (batch_size, input_length, input_dimension)
-        // to:   (batch_size, input_length, attention_head_count, head_dimension)
-        let new_shape = [
-            batch_size,
-            input_length,
-            self.attention_head_count,
-            self.head_dimension,
-        ];
-        let query_output = query_output.reshape(new_shape);
-        let key_output = key_output.reshape(new_shape);
-        let value_output = value_output.reshape(new_shape);
-
-        // reshape. swap dimensions 1 (input_length) and 2 (attention_head_count)
-        // from: (batch_size, input_length, attention_head_count, head_dimension)
-        // to:   (batch_size, attention_head_count, input_length, head_dimension)
-        let new_dimension_order = [0, 2, 1, 3];
-        let query_output = query_output.permute(new_dimension_order);
-        let key_output = key_output.permute(new_dimension_order);
-        let value_output = value_output.permute(new_dimension_order);
+        let query = self.split_heads(query);
+        let key = self.split_heads(key);
+        let value = self.split_heads(value);
 
         // scaled dot product attention
-        let scores =
-            self.scaled_dot_product_attention(query_output, key_output, value_output.clone(), mask);
-
-        let attention_weights = softmax(scores, 3);
-        let context_values = attention_weights.matmul(value_output);
+        let context = self.scaled_dot_product_attention(query, key, value, mask);
 
         // final output layer
-        let context_values = context_values.reshape([
-            batch_size,
-            input_length,
-            self.attention_head_count * self.head_dimension,
-        ]);
-        let dense_output = self.dense.forward(context_values);
-        let dense_output = relu(dense_output);
-        let dense_output = self.output.forward(dense_output);
+        let merged = self.merge_heads(context);
+        let output = self.output_projection.forward(merged);
 
-        dense_output
+        output
     }
 }
